@@ -1,3 +1,4 @@
+import ast
 import os
 import sys
 from fnmatch import fnmatch
@@ -23,6 +24,144 @@ EXT_TO_LANG = {
     "rb": "ruby",
 }
 
+def extract_signatures_and_docstrings(file_path):
+    """Extract function signatures and docstrings from a Python file."""
+    try:
+        with open(file_path, 'r') as f:
+            source = f.read()
+        
+        # Replace tabs with spaces to normalize indentation
+        source = source.replace('\t', '    ')
+        module = ast.parse(source)
+        source_lines = source.splitlines()
+        
+        # Function to extract the signature from source lines with proper indentation
+        def get_signature(node, parent_indentation=0):
+            line_index = node.lineno - 1  # AST line numbers are 1-based
+            
+            # Find the complete signature (handle multi-line signatures)
+            line = source_lines[line_index]
+            
+            # Get the base indentation level of the first line
+            # Find leading whitespace in the current line
+            current_indentation = len(line) - len(line.lstrip())
+            
+            # For the first line in a method, we'll use the parent_indentation + 4
+            if parent_indentation > 0:
+                first_line = ' ' * parent_indentation + line.lstrip()
+            else:
+                first_line = line
+            
+            signature_lines = [first_line]
+            
+            # Keep adding lines until we find the closing colon
+            while not signature_lines[-1].rstrip().endswith(':'):
+                line_index += 1
+                if line_index >= len(source_lines):
+                    break  # Avoid index errors
+                
+                next_line = source_lines[line_index]
+                
+                # For continuation lines in a method signature, maintain alignment with opening parenthesis
+                if parent_indentation > 0:
+                    # Find the position of the first opening parenthesis in the signature
+                    first_line_stripped = first_line.lstrip()
+                    paren_pos = first_line_stripped.find('(')
+                    if paren_pos != -1:
+                        # Calculate the indentation needed to align with the opening parenthesis
+                        align_pos = parent_indentation + paren_pos + 1  # +1 for the character after '('
+                        next_line_content = next_line.lstrip()
+                        next_line = ' ' * align_pos + next_line_content
+                    else:
+                        # If no opening parenthesis, use consistent indentation
+                        next_line = ' ' * (parent_indentation + 4) + next_line.lstrip()
+                
+                signature_lines.append(next_line)
+            
+            return '\n'.join(signature_lines)
+        
+        # Function to normalize docstring indentation
+        def normalize_docstring(docstring, indentation=0):
+            if not docstring:
+                return None
+                
+            lines = docstring.splitlines()
+            
+            # If only one line, return it with proper indentation
+            if len(lines) == 1:
+                return docstring
+                
+            # For multi-line docstrings, normalize the indentation
+            # First, find the minimum indentation of non-empty lines after the first
+            min_indent = float('inf')
+            for line in lines[1:]:
+                # Skip empty lines
+                if line.strip():
+                    curr_indent = len(line) - len(line.lstrip())
+                    min_indent = min(min_indent, curr_indent)
+            
+            # If no non-empty lines were found, return the original
+            if min_indent == float('inf'):
+                min_indent = 0
+                
+            # Create normalized lines with proper indentation
+            normalized = [lines[0]]  # First line stays as is
+            for line in lines[1:]:
+                if line.strip():  # Non-empty line
+                    # Remove the common indentation and add the desired indentation
+                    normalized.append(' ' * indentation + line[min_indent:])
+                else:  # Empty line
+                    normalized.append('')
+                    
+            return '\n'.join(normalized)
+        
+        results = []
+        
+        # Process all top-level function and class definitions
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef):
+                # Extract function signature from source
+                signature = get_signature(node)
+                
+                # Get docstring if available
+                docstring = ast.get_docstring(node)
+                if docstring:
+                    docstring = normalize_docstring(docstring, 4)
+                    results.append(f"{signature}\n    \"\"\"{docstring}\"\"\"")
+                else:
+                    results.append(signature)
+            
+            elif isinstance(node, ast.ClassDef):
+                # Extract class signature from source
+                class_sig = get_signature(node)
+                
+                # Get class docstring if available
+                class_docstring = ast.get_docstring(node)
+                if class_docstring:
+                    class_docstring = normalize_docstring(class_docstring, 4)
+                    class_entry = f"{class_sig}\n    \"\"\"{class_docstring}\"\"\""
+                else:
+                    class_entry = class_sig
+                
+                results.append(class_entry)
+                
+                # Process class methods
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        # Extract method signature from source with 4-space indentation
+                        method_sig = get_signature(item, 4)
+                        
+                        # Get method docstring if available
+                        method_docstring = ast.get_docstring(item)
+                        if method_docstring:
+                            method_docstring = normalize_docstring(method_docstring, 8)
+                            results.append(f"{method_sig}\n        \"\"\"{method_docstring}\"\"\"")
+                        else:
+                            results.append(f"{method_sig}")
+        
+        return "\n\n".join(results)
+    except Exception as e:
+        return f"Error extracting signatures from {file_path}: {str(e)}"
 
 def should_ignore(path, gitignore_rules):
     for rule in gitignore_rules:
@@ -85,7 +224,13 @@ def print_as_xml(writer, path, content, line_numbers):
 
 
 def print_as_markdown(writer, path, content, line_numbers):
-    lang = EXT_TO_LANG.get(path.split(".")[-1], "")
+    # Extract the file extension for language detection
+    file_path = path
+    if " (signatures only)" in path:
+        file_path = path.split(" (signatures only)")[0]
+        
+    lang = EXT_TO_LANG.get(file_path.split(".")[-1], "")
+    
     # Figure out how many backticks to use
     backticks = "```"
     while backticks in content:
@@ -110,11 +255,26 @@ def process_path(
     claude_xml,
     markdown,
     line_numbers=False,
+    signature_patterns=None,
 ):
+    if signature_patterns is None:
+        signature_patterns = []
+    
     if os.path.isfile(path):
         try:
-            with open(path, "r") as f:
-                print_path(writer, path, f.read(), claude_xml, markdown, line_numbers)
+            # Check if this file should have only signatures extracted
+            should_extract_signatures = any(fnmatch(path, pattern) for pattern in signature_patterns)
+            
+            if should_extract_signatures and path.endswith('.py'):
+                content = extract_signatures_and_docstrings(path)
+                print_path(writer, f"{path} (signatures only)", content, claude_xml, markdown, line_numbers)
+            else:
+                if should_extract_signatures and not path.endswith('.py'):
+                    warning_message = f"Warning: Skipping signatures-only extraction for non-Python file {path}"
+                    click.echo(click.style(warning_message, fg="red"), err=True)
+                
+                with open(path, "r") as f:
+                    print_path(writer, path, f.read(), claude_xml, markdown, line_numbers)
         except UnicodeDecodeError:
             warning_message = f"Warning: Skipping file {path} due to UnicodeDecodeError"
             click.echo(click.style(warning_message, fg="red"), err=True)
@@ -156,19 +316,21 @@ def process_path(
             for file in sorted(files):
                 file_path = os.path.join(root, file)
                 try:
-                    with open(file_path, "r") as f:
-                        print_path(
-                            writer,
-                            file_path,
-                            f.read(),
-                            claude_xml,
-                            markdown,
-                            line_numbers,
-                        )
+                    # Check if this file should have only signatures extracted
+                    should_extract_signatures = any(fnmatch(file_path, pattern) for pattern in signature_patterns)
+                    
+                    if should_extract_signatures and file_path.endswith('.py'):
+                        content = extract_signatures_and_docstrings(file_path)
+                        print_path(writer, f"{file_path} (signatures only)", content, claude_xml, markdown, line_numbers)
+                    else:
+                        if should_extract_signatures and not file_path.endswith('.py'):
+                            warning_message = f"Warning: Skipping signatures-only extraction for non-Python file {file_path}"
+                            click.echo(click.style(warning_message, fg="red"), err=True)
+                        
+                        with open(file_path, "r") as f:
+                            print_path(writer, file_path, f.read(), claude_xml, markdown, line_numbers)
                 except UnicodeDecodeError:
-                    warning_message = (
-                        f"Warning: Skipping file {file_path} due to UnicodeDecodeError"
-                    )
+                    warning_message = f"Warning: Skipping file {file_path} due to UnicodeDecodeError"
                     click.echo(click.style(warning_message, fg="red"), err=True)
 
 
@@ -244,6 +406,12 @@ def read_paths_from_stdin(use_null_separator):
     is_flag=True,
     help="Use NUL character as separator when reading from stdin",
 )
+@click.option(
+    "signature_patterns",
+    "--signatures-only",
+    multiple=True,
+    help="Patterns of Python files (e.g., '*.py' or 'utils.py') for which to extract only function signatures and docstrings. Only works with Python files.",
+)
 @click.version_option()
 def cli(
     paths,
@@ -257,6 +425,7 @@ def cli(
     markdown,
     line_numbers,
     null,
+    signature_patterns,
 ):
     """
     Takes one or more paths to files or directories and outputs every file,
@@ -308,6 +477,7 @@ def cli(
     if output_file:
         fp = open(output_file, "w", encoding="utf-8")
         writer = lambda s: print(s, file=fp)
+    
     for path in paths:
         if not os.path.exists(path):
             raise click.BadArgumentUsage(f"Path does not exist: {path}")
@@ -327,6 +497,7 @@ def cli(
             claude_xml,
             markdown,
             line_numbers,
+            signature_patterns,
         )
     if claude_xml:
         writer("</documents>")
